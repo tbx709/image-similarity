@@ -1,0 +1,8 @@
+Pillow>=9.0
+numpy>=1.24
+# --- GUI 界面依赖 (gui.py) ---
+# tkinter 是 Python 自带的标准库，无需 pip 安装：
+#   Linux:   sudo apt install python3-tk
+#   Windows/ macOS: 使用 python.org 官方安装包(自带)
+# --- 可选: 让 GUI 支持拖拽文件 ---
+# tkinterdnd2
