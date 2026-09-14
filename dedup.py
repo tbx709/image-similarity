@@ -183,19 +183,28 @@ def group_similar(files, threshold=0.95, method="phash", progress=None):
 
 # ---------------------------------------------------------------- 归档计划
 
+def keeper_key(path, root):
+    """基准图的排序键: 顶层优先 → 名字短的优先 → 文件名自然排序
+
+    顶层优先: 否则 '旅行/海边2.png' 会因为中文码位小于 '海边.png' 被选成基准,
+              结果把顶层的原图往子文件夹里搬, 与直觉相反。
+    短名优先: 副本的名字通常更长('海边-副本.png'、'照片 (1).jpg'、'xx_备份.png'),
+              所以同层里短名更像原件; 而 a.png / b.png 这种同长的仍按文件名排序。
+    """
+    r = rel(path, root)
+    return (r.count(os.sep), len(os.path.basename(r)), natural_key(r))
+
+
 def pick_keeper(members, keep, root):
-    """从一组里挑基准图; 同分时按文件名自然排序, 所以 a.png 优先于 b.png"""
+    """从一组里挑基准图; keep=first 时按上面的规则, 所以 a.png 优先于 b.png"""
     if keep == "first":
-        return sorted(members, key=lambda p: natural_key(rel(p, root)))[0]
+        return sorted(members, key=lambda p: keeper_key(p, root))[0]
     if keep == "largest":
-        return sorted(members, key=lambda p: (-os.path.getsize(p),
-                                              natural_key(rel(p, root))))[0]
+        return sorted(members, key=lambda p: (-os.path.getsize(p),) + keeper_key(p, root))[0]
     if keep == "oldest":
-        return sorted(members, key=lambda p: (os.path.getmtime(p),
-                                              natural_key(rel(p, root))))[0]
+        return sorted(members, key=lambda p: (os.path.getmtime(p),) + keeper_key(p, root))[0]
     if keep == "newest":
-        return sorted(members, key=lambda p: (-os.path.getmtime(p),
-                                              natural_key(rel(p, root))))[0]
+        return sorted(members, key=lambda p: (-os.path.getmtime(p),) + keeper_key(p, root))[0]
     raise ValueError(f"未知的 keep 选项: {keep}")
 
 
@@ -229,7 +238,7 @@ def build_plan(root, groups, keep, hash_by_path=None):
         if folder:
             taken.add(folder)
         plan.append({"keeper": keeper, "folder": folder, "others": others, "sims": sims})
-    plan.sort(key=lambda g: natural_key(rel(g["keeper"], root)))
+    plan.sort(key=lambda g: keeper_key(g["keeper"], root))
     return plan
 
 
@@ -240,8 +249,13 @@ def write_json(path, data):
         json.dump(data, fh, ensure_ascii=False, indent=2)
 
 
-def apply_plan(root, plan, mode, keep, log_path=None, threshold=None, method=None):
-    """真正移动文件; 返回 (日志路径, 已移动数, 失败列表)"""
+def apply_plan(root, plan, mode, keep, log_path=None, threshold=None, method=None,
+               on_move=None):
+    """真正移动文件; 返回 (日志路径, 已移动数, 失败列表)
+
+    on_move: 每移动一个文件回调一次(默认打印到终端), GUI 用它把进度写到界面上。
+    """
+    say = on_move or print
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log_path = log_path or os.path.join(root, f"{LOG_PREFIX}{stamp}.json")
     moves, folders, failed = [], [], []
@@ -264,7 +278,7 @@ def apply_plan(root, plan, mode, keep, log_path=None, threshold=None, method=Non
             moves.append({"src": src, "dst": dst})
             moved_here.append({"name": os.path.basename(dst),
                                "from": rel(os.path.dirname(src), root)})
-            print(f"  移动 {rel(src, root)}  ->  {rel(dst, root)}")
+            say(f"  移动 {rel(src, root)}  ->  {rel(dst, root)}")
         write_json(os.path.join(folder, MARKER), {
             "tool": "dedup.py",
             "mode": mode, "method": method, "threshold": threshold, "keep": keep,
@@ -282,8 +296,12 @@ def apply_plan(root, plan, mode, keep, log_path=None, threshold=None, method=Non
     return log_path, len(moves), failed
 
 
-def run_undo(log_path):
-    """按日志把文件原样移回去, 并清理空的归档文件夹"""
+def run_undo(log_path, on_move=None):
+    """按日志把文件原样移回去, 并清理空的归档文件夹
+
+    on_move: 每还原一个文件回调一次(默认打印到终端), 供 GUI 显示进度。
+    """
+    say = on_move or print
     with open(log_path, encoding="utf-8") as fh:
         data = json.load(fh)
 
@@ -300,7 +318,7 @@ def run_undo(log_path):
         try:
             shutil.move(dst, src)
             moved_back += 1
-            print(f"  还原 {rel(src, data.get('root', '.'))}")
+            say(f"  还原 {rel(src, data.get('root', '.'))}")
         except Exception as exc:
             skipped.append((dst, f"还原失败: {exc}"))
 
@@ -385,7 +403,7 @@ def main():
                     help="similar 模式的哈希方法 (默认 phash)")
     ap.add_argument("-k", "--keep", default="first",
                     choices=["first", "largest", "oldest", "newest"],
-                    help="哪张作基准图: first=文件名最前(默认) / largest / oldest / newest")
+                    help="哪张作基准图: first=名字最短最靠前(默认) / largest / oldest / newest")
     ap.add_argument("--no-recursive", action="store_true", help="只扫描顶层, 不进子文件夹")
     ap.add_argument("--log", metavar="路径", help="指定日志文件路径")
     ap.add_argument("--undo", metavar="日志文件", help="按日志撤销上一次移动")

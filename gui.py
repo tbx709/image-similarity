@@ -10,8 +10,11 @@
     - Pillow, numpy
     - tkinter（Python 自带；Linux 若缺失: sudo apt install python3-tk）
     - 可选 tkinterdnd2: pip install tkinterdnd2   # 启用拖拽图片到窗口
+
+三个页签: 单张比较 / 批量扫描 / 去重归档
 """
 
+import json
 import os
 import queue
 import sys
@@ -28,13 +31,15 @@ except Exception:  # tkinter 缺失时提供桩对象, 保证模块可导入(供
     tk = _types.SimpleNamespace(StringVar=lambda: None, Label=object, Toplevel=object)
     ttk = _types.SimpleNamespace(Frame=object, Label=object, Entry=object, Button=object,
                                  Notebook=object, Combobox=object, Spinbox=object,
-                                 Progressbar=object, Treeview=object)
+                                 Progressbar=object, Treeview=object, Checkbutton=object)
     filedialog = _types.SimpleNamespace(askopenfilename=None, askdirectory=None,
                                         asksaveasfilename=None)
-    messagebox = _types.SimpleNamespace(showwarning=None, showerror=None, showinfo=None)
+    messagebox = _types.SimpleNamespace(showwarning=None, showerror=None, showinfo=None,
+                                        askyesno=None)
     ImageTk = None
 
 import batch_compare
+import dedup
 from compare import (phash, ssim, hist_sim, mse_score, auto_verdict, _hash_sim)
 
 GREEN = "#1a7f37"
@@ -361,31 +366,14 @@ class BatchTab(ttk.Frame):
         self.tree.tag_configure("anchor", foreground=GRAY)
 
     def _set_path(self, iid, m_or_path):
-        self.tree._paths = getattr(self.tree, "_paths", {})
-        if isinstance(m_or_path, dict):
-            self.tree._paths[iid] = m_or_path
-        else:
-            self.tree._paths[iid] = m_or_path
+        tree_put_path(self.tree, iid, m_or_path)
 
     def _preview(self, event):
         iid = self.tree.identify_row(event.y)
-        paths = getattr(self.tree, "_paths", {})
-        if iid not in paths:
+        data = getattr(self.tree, "_paths", {}).get(iid)
+        if data is None:
             return
-        data = paths[iid]
-        path = data["a"] if isinstance(data, dict) else data
-        try:
-            im = Image.open(path).convert("RGB")
-            im.thumbnail((420, 420))
-            win = tk.Toplevel(self)
-            win.title(os.path.basename(path))
-            photo = ImageTk.PhotoImage(im)
-            lbl = tk.Label(win, image=photo)
-            lbl.image = photo
-            lbl.pack()
-            tk.Label(win, text=path, fg=GRAY).pack()
-        except Exception as exc:
-            messagebox.showerror("预览失败", str(exc))
+        show_image_window(self, data["a"] if isinstance(data, dict) else data)
 
     def export_csv(self):
         if not self.last_res:
@@ -395,6 +383,376 @@ class BatchTab(ttk.Frame):
         if path:
             batch_compare.write_csv(self.last_res, path)
             messagebox.showinfo("导出成功", f"已导出: {path}")
+
+
+# ---------------------------------------------------------------- 结果表格的公共小工具
+
+def tree_put_path(tree, iid, path):
+    """记住某一行对应的文件路径(或跨目录匹配的 dict), 供双击预览用"""
+    tree._paths = getattr(tree, "_paths", {})
+    tree._paths[iid] = path
+
+
+def show_image_window(parent, path):
+    """弹出图片预览小窗"""
+    try:
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((420, 420))
+        win = tk.Toplevel(parent)
+        win.title(os.path.basename(path))
+        photo = ImageTk.PhotoImage(im)
+        lbl = tk.Label(win, image=photo)
+        lbl.image = photo                     # 保留引用, 否则会被回收成空白
+        lbl.pack()
+        tk.Label(win, text=path, fg=GRAY).pack()
+    except Exception as exc:
+        messagebox.showerror("预览失败", str(exc))
+
+
+# ---------------------------------------------------------------- 去重归档页
+
+MODE_LABELS = {"完全相同(逐字节比对)": "exact", "相似(感知哈希)": "similar"}
+KEEP_LABELS = {"文件名最前": "first", "体积最大": "largest",
+               "最早修改": "oldest", "最新修改": "newest"}
+
+
+class DedupTab(ttk.Frame):
+    """去重归档页: 选文件夹 -> 预演列表 -> 一键归档 / 撤销
+
+    刻意做成"先预演、再归档": 没有预演结果时归档按钮是灰的, 归档前还要再确认一次。
+    """
+
+    def __init__(self, master, root):
+        super().__init__(master, padding=10)
+        self.root = root
+        self.queue = queue.Queue()
+        self.plan = None            # 预演得到的归档计划
+        self.root_dir = ""          # 预演时的文件夹(归档以它为准, 免得中途改了输入框)
+        self.scan_meta = None       # 预演时用的 (mode, keep, threshold, method)
+        self.last_log = None        # 最近一次执行的日志 -> "撤销本次归档"
+        self.busy = False
+
+        self.folder = tk.StringVar()
+        self.mode = tk.StringVar(value="完全相同(逐字节比对)")
+        self.threshold = tk.StringVar(value="0.95")
+        self.keep = tk.StringVar(value="文件名最前")
+        self.recursive = tk.BooleanVar(value=True)
+
+        tk.Label(self, text="图片去重归档：重复图片移入以基准图命名的子文件夹",
+                 font=("", 13, "bold")).grid(row=0, column=0, columnspan=4,
+                                             sticky="w", pady=(0, 8))
+
+        ttk.Label(self, text="图片文件夹:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(self, textvariable=self.folder).grid(row=1, column=1, sticky="we")
+        ttk.Button(self, text="浏览...", command=self._browse).grid(
+            row=1, column=2, sticky="w", padx=5)
+
+        opt = ttk.Frame(self)
+        opt.grid(row=2, column=0, columnspan=4, sticky="w", pady=8)
+        ttk.Label(opt, text="判重方式:").pack(side="left")
+        self.mode_cb = ttk.Combobox(opt, textvariable=self.mode, state="readonly", width=20,
+                                    values=list(MODE_LABELS))
+        self.mode_cb.pack(side="left", padx=5)
+        self.mode_cb.bind("<<ComboboxSelected>>", self._on_mode)
+        ttk.Label(opt, text="阈值:").pack(side="left", padx=(10, 0))
+        self.spin = ttk.Spinbox(opt, from_=0.70, to=1.00, increment=0.01, width=6,
+                                textvariable=self.threshold, state="disabled")
+        self.spin.pack(side="left", padx=5)
+        ttk.Label(opt, text="保留:").pack(side="left", padx=(10, 0))
+        ttk.Combobox(opt, textvariable=self.keep, state="readonly", width=10,
+                     values=list(KEEP_LABELS)).pack(side="left", padx=5)
+        ttk.Checkbutton(opt, text="含子文件夹", variable=self.recursive).pack(
+            side="left", padx=(10, 0))
+        self.btn_preview = ttk.Button(opt, text="开始预演", command=self.preview)
+        self.btn_preview.pack(side="left", padx=10)
+
+        self.bar = ttk.Progressbar(self, mode="determinate")
+        self.bar.grid(row=3, column=0, columnspan=4, sticky="we", pady=(4, 6))
+
+        cols = ("group", "file", "note")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings")
+        for c, w, txt in zip(cols, (70, 500, 230), ("组", "文件", "说明")):
+            self.tree.heading(c, text=txt)
+            self.tree.column(c, width=w, anchor="center" if c == "group" else "w")
+        self.tree.grid(row=4, column=0, columnspan=4, sticky="nsew")
+        self.tree.bind("<Double-1>", self._preview)
+
+        act = ttk.Frame(self)
+        act.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.btn_apply = ttk.Button(act, text="一键归档(移动文件)", command=self.apply_now,
+                                    state="disabled")
+        self.btn_apply.pack(side="left", padx=(0, 5))
+        self.btn_undo = ttk.Button(act, text="撤销本次归档", command=self.undo_last,
+                                   state="disabled")
+        self.btn_undo.pack(side="left", padx=5)
+        ttk.Button(act, text="按日志撤销...", command=self.undo_from_file).pack(
+            side="left", padx=5)
+
+        self.status = tk.Label(self, text="先选文件夹 → 点“开始预演”看清单，确认后再归档",
+                               fg=GRAY, anchor="w", justify="left", wraplength=900)
+        self.status.grid(row=6, column=0, columnspan=4, sticky="we", pady=(6, 0))
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(4, weight=1)
+        self.root.after(POLL_MS, self._poll)
+
+    # ------------------------------------------------------------ 界面小动作
+
+    def _browse(self):
+        path = filedialog.askdirectory(title="选择要整理的图片文件夹")
+        if path:
+            self.folder.set(path)
+
+    def _on_mode(self, _e=None):
+        self.spin.configure(state="normal" if self.mode.get().startswith("相似") else "disabled")
+
+    def _opts(self):
+        mode = MODE_LABELS.get(self.mode.get(), "exact")
+        keep = KEEP_LABELS.get(self.keep.get(), "first")
+        try:
+            th = min(max(float(self.threshold.get()), 0.0), 1.0)
+        except ValueError:
+            th = 0.95
+        return mode, keep, th
+
+    def _set_busy(self, busy, text=None):
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        self.btn_preview.configure(state=state)
+        self.btn_apply.configure(state="disabled" if busy or not self.plan else "normal")
+        self.btn_undo.configure(
+            state="normal" if not busy and self.last_log else "disabled")
+        if text is not None:
+            self.status.config(text=text)
+
+    def _clear_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.tree._paths = {}
+
+    def _preview(self, event):
+        iid = self.tree.identify_row(event.y)
+        path = getattr(self.tree, "_paths", {}).get(iid)
+        if path:
+            show_image_window(self, path)
+
+    # ------------------------------------------------------------ 预演
+
+    def preview(self):
+        if self.busy:
+            return
+        folder = self.folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("提示", "请先选择要整理的图片文件夹")
+            return
+        mode, keep, th = self._opts()
+        rec = bool(self.recursive.get())
+        folder = os.path.abspath(folder)
+        self.plan = None
+        self.last_log = None
+        self._clear_tree()
+        self.bar.configure(value=0, maximum=1)
+        self._set_busy(True, "预演中... 正在扫描图片")
+        threading.Thread(target=self._work_preview,
+                         args=(folder, mode, keep, th, rec), daemon=True).start()
+
+    def _work_preview(self, folder, mode, keep, th, rec):
+        def progress(done, total):
+            self.queue.put(("progress", {"done": done, "total": total}))
+        try:
+            files = dedup.list_images(folder, rec)
+            unreadable = []
+            hash_by_path = None
+            if not files:
+                groups = []
+            elif mode == "exact":
+                groups = dedup.group_exact(files, progress)
+            else:
+                groups, hash_by_path, unreadable = dedup.group_similar(
+                    files, threshold=th, method="phash", progress=progress)
+            plan = dedup.build_plan(folder, groups, keep, hash_by_path)
+            skipped = 0
+            if rec:
+                for dirpath, dirnames, _names in os.walk(folder):
+                    skipped += sum(1 for d in dirnames
+                                   if dedup.is_archive_dir(os.path.join(dirpath, d)))
+            self.queue.put(("preview_done", {
+                "folder": folder, "plan": plan, "mode": mode, "keep": keep,
+                "threshold": th, "files": len(files), "unreadable": unreadable,
+                "skipped": skipped, "recursive": rec}))
+        except Exception as exc:
+            self.queue.put(("error", f"预演失败: {exc}"))
+
+    def _show_preview(self, info):
+        folder, plan = info["folder"], info["plan"]
+        self.root_dir = folder
+        self.plan = plan if any(g["folder"] for g in plan) else None
+        self.scan_meta = (info["mode"], info["keep"], info["threshold"], "phash")
+        self._clear_tree()
+        for gi, group in enumerate(plan, 1):
+            keeper = dedup.rel(group["keeper"], folder)
+            iid = f"g{gi}x0"
+            if not group["folder"]:
+                self.tree.insert("", "end", tags=("skip",),
+                                 values=(f"组{gi}", keeper, "跳过: 归档文件夹名被占用"))
+                tree_put_path(self.tree, iid, group["keeper"])
+                continue
+            target = dedup.rel(group["folder"], folder) + os.sep
+            self.tree.insert("", "end", tags=("anchor",),
+                             values=(f"组{gi}", keeper, f"基准(保留) → {target}"))
+            tree_put_path(self.tree, iid, group["keeper"])
+            for k, src in enumerate(group["others"], 1):
+                note = ("完全相同" if group["sims"] is None
+                        else f"相似度 {group['sims'][src]:.2f}")
+                iid = f"g{gi}x{k}"
+                self.tree.insert("", "end", values=(f"组{gi}", dedup.rel(src, folder), note))
+                tree_put_path(self.tree, iid, src)
+        self.tree.tag_configure("anchor", foreground=GRAY)
+        self.tree.tag_configure("skip", foreground=ORANGE)
+        self.tree.tag_configure("moved", foreground=GREEN)
+
+        total = sum(len(g["others"]) for g in plan if g["folder"])
+        self.bar.configure(value=self.bar.cget("maximum"))
+        if total == 0:
+            self._set_busy(False, f"预演完成: 扫描 {info['files']} 张图片, "
+                                  f"没有需要归档的重复图片")
+            return
+        extra = ""
+        if info["unreadable"]:
+            extra += f", 无法读取 {len(info['unreadable'])} 张"
+        if info["skipped"]:
+            extra += f", 跳过 {info['skipped']} 个已有归档文件夹"
+        self._set_busy(False, f"预演完成: {len(plan)} 组, 待移动 {total} 张"
+                              f"(扫描 {info['files']} 张{extra})。确认无误后点“一键归档”")
+
+    # ------------------------------------------------------------ 归档
+
+    def apply_now(self):
+        if self.busy or not self.plan:
+            return
+        groups = [g for g in self.plan if g["folder"]]
+        total = sum(len(g["others"]) for g in groups)
+        if not total:
+            messagebox.showinfo("提示", "没有需要移动的文件")
+            return
+        if not messagebox.askyesno(
+                "确认归档",
+                f"将把 {total} 个文件移动到 {len(groups)} 个归档文件夹（以基准图命名）。\n\n"
+                f"文件夹: {self.root_dir}\n\n"
+                "基准图片留在原位，全程只是移动、不删除任何文件。\n"
+                "完成后可以随时点“撤销本次归档”原样还原。\n\n确定继续吗？"):
+            return
+        mode, keep, th, method = self.scan_meta
+        self._set_busy(True, "归档中... 正在移动文件")
+        threading.Thread(target=self._work_apply,
+                         args=(self.root_dir, self.plan, mode, keep, th, method),
+                         daemon=True).start()
+
+    def _work_apply(self, folder, plan, mode, keep, th, method):
+        try:
+            log_path, moved, failed = dedup.apply_plan(
+                folder, plan, mode=mode, keep=keep, threshold=th, method=method,
+                on_move=lambda line: self.queue.put(("say", line.strip())))
+            self.queue.put(("applied", {"folder": folder, "log": log_path,
+                                        "moved": moved, "failed": failed}))
+        except Exception as exc:
+            self.queue.put(("error", f"归档失败: {exc}"))
+
+    def _show_applied(self, info):
+        folder = info["folder"]
+        self._clear_tree()
+        try:
+            with open(info["log"], encoding="utf-8") as fh:
+                data = json.load(fh)
+            for k, m in enumerate(data.get("moves", []), 1):
+                iid = f"m{k}"
+                self.tree.insert("", "end", tags=("moved",),
+                                 values=("", dedup.rel(m["dst"], folder), "已移动"))
+                tree_put_path(self.tree, iid, m["dst"])
+        except Exception:
+            pass
+        self.plan = None
+        self.last_log = info["log"]
+        self._set_busy(False, f"归档完成: 移动 {info['moved']} 张图片。"
+                              f"日志已保存，可点“撤销本次归档”还原。")
+        if info["failed"]:
+            detail = "\n".join(f"{p}  ({why})" for p, why in info["failed"][:10])
+            messagebox.showwarning("部分文件未处理", detail)
+
+    # ------------------------------------------------------------ 撤销
+
+    def undo_last(self):
+        if self.busy or not self.last_log:
+            return
+        if not messagebox.askyesno("确认撤销",
+                                   f"将按日志把文件移回原来的位置：\n\n{self.last_log}\n\n"
+                                   "原位置若已有同名文件会跳过，不会覆盖。继续吗？"):
+            return
+        self._start_undo(self.last_log)
+
+    def undo_from_file(self):
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(
+            title="选择去重日志(.dedup-log-*.json)",
+            initialdir=self.folder.get().strip() or None,
+            filetypes=[("去重日志", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        if not messagebox.askyesno("确认撤销",
+                                   f"将按日志把文件移回原来的位置：\n\n{path}\n\n继续吗？"):
+            return
+        self._start_undo(path)
+
+    def _start_undo(self, log_path):
+        self._clear_tree()
+        self._set_busy(True, "撤销中... 正在移回文件")
+        threading.Thread(target=self._work_undo, args=(log_path,), daemon=True).start()
+
+    def _work_undo(self, log_path):
+        try:
+            back, removed, skipped = dedup.run_undo(
+                log_path, on_move=lambda line: self.queue.put(("say", line.strip())))
+            self.queue.put(("undone", {"log": log_path, "back": back,
+                                       "removed": removed, "skipped": skipped}))
+        except Exception as exc:
+            self.queue.put(("error", f"撤销失败: {exc}"))
+
+    def _show_undone(self, info):
+        if info["log"] == self.last_log:
+            self.last_log = None
+        self._clear_tree()
+        self._set_busy(False, f"撤销完成: 还原 {info['back']} 个文件, "
+                              f"清理 {info['removed']} 个空归档文件夹。"
+                              f"（可重新点“开始预演”查看当前状态）")
+        if info["skipped"]:
+            detail = "\n".join(f"{p}  ({why})" for p, why in info["skipped"][:10])
+            messagebox.showwarning("部分文件未还原", detail)
+
+    # ------------------------------------------------------------ 消息循环
+
+    def _poll(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                kind, data = msg[0], msg[1]
+                if kind == "progress":
+                    self.bar.configure(maximum=max(1, data["total"]), value=data["done"])
+                    self.status.config(text=f"预演中... 已扫描 {data['done']}/{data['total']} 张")
+                elif kind == "say":
+                    self.status.config(text=data)
+                elif kind == "preview_done":
+                    self._show_preview(data)
+                elif kind == "applied":
+                    self._show_applied(data)
+                elif kind == "undone":
+                    self._show_undone(data)
+                elif kind == "error":
+                    self._set_busy(False, data)
+                    messagebox.showerror("出错了", data)
+        except queue.Empty:
+            pass
+        self.root.after(POLL_MS, self._poll)
 
 
 # ---------------------------------------------------------------- 入口
@@ -408,8 +766,10 @@ class App:
         nb.pack(fill="both", expand=True)
         self.compare_tab = CompareTab(nb, root, have_dnd)
         self.batch_tab = BatchTab(nb, root)
+        self.dedup_tab = DedupTab(nb, root)
         nb.add(self.compare_tab, text=" 单张比较 ")
         nb.add(self.batch_tab, text=" 批量扫描 ")
+        nb.add(self.dedup_tab, text=" 去重归档 ")
 
 
 def selftest():
@@ -423,10 +783,10 @@ def selftest():
     root.update()
     tabs = len(root.winfo_children()[0].tabs()) if root.winfo_children() else 0
     root.destroy()
-    if tabs == 2:
-        print(f"GUI 自检通过 (2 个页面, 拖拽支持: {'有' if have_dnd else '无'})")
+    if tabs == 3:
+        print(f"GUI 自检通过 (3 个页面, 拖拽支持: {'有' if have_dnd else '无'})")
         return 0
-    print("自检失败: 界面结构不正确")
+    print(f"自检失败: 界面结构不正确(页签数 {tabs}, 应为 3)")
     return 1
 
 

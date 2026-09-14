@@ -126,8 +126,8 @@ code, out = run(d)
 check("预演后文件一个没动", snap(d) == before)
 check("预演输出提示 --apply", "--apply" in out)
 code, out = run(d, "--apply")
-check("中文名归档成功",
-      sorted(snap(d)) == sorted(["副本一.png", "副本一/原图.png", "副本一/副本二.png"]), sorted(snap(d)))
+check("中文名归档成功: 名字最短的 原图.png 当基准",
+      sorted(snap(d)) == sorted(["原图.png", "原图/副本一.png", "原图/副本二.png"]), sorted(snap(d)))
 
 print("G. --keep oldest")
 d = fresh("h")
@@ -158,6 +158,17 @@ A.save(os.path.join(d, "b.png"))
 run(d, "--apply")
 code, out = run(d, "--apply")
 check("重复执行无操作", "没有发现重复" in out, out)
+
+print("J. 顶层优先 + 短名优先: 原图不会被副本抢走基准位")
+d = fresh("k")
+A.save(os.path.join(d, "海边.png"))
+A.save(os.path.join(d, "海边-副本.png"))
+os.makedirs(os.path.join(d, "旅行"))
+A.save(os.path.join(d, "旅行", "海边2.png"))
+run(d, "--apply")
+check("基准是顶层的 海边.png(而不是 旅行/海边2.png 或 海边-副本.png)",
+      sorted(snap(d)) == sorted(["海边.png", "海边/海边-副本.png", "海边/海边2.png"]),
+      sorted(snap(d)))
 
 shutil.rmtree(WS, ignore_errors=True)
 print()
